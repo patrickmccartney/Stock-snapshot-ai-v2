@@ -1,121 +1,210 @@
-import io, base64
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-import matplotlib.dates as mdates
-import yfinance as yf
-from flask import Flask, render_template_string, request, Response
+from flask import Flask, request, Response, render_template_string
 from openai import OpenAI
+import yfinance as yf
+import matplotlib.pyplot as plt
+import io
+import base64
+import os
+import requests
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
 app = Flask(__name__)
-client = OpenAI()
-plt.switch_backend("Agg")
+app.config["PROPAGATE_EXCEPTIONS"] = True
 
-TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>{{ ticker }} Snapshot</title>
-  <style>
-    body { font-family: system-ui, sans-serif; text-align:center; margin:2em; }
-    img { max-width:100%%; border-radius:12px; box-shadow:0 0 10px #ccc; }
-    input { padding:0.5em; font-size:1em; border-radius:6px; border:1px solid #aaa; }
-    button { padding:0.5em 1em; font-size:1em; border:none; border-radius:6px; background:#007bff; color:white; cursor:pointer; }
-    .comment { margin-top:1em; font-size:1.1em; max-width:700px; margin-left:auto; margin-right:auto; text-align:left; }
-  </style>
-</head>
-<body>
-  <h1>{{ ticker }} Stock Snapshot</h1>
-  <form action="/" method="get">
-    <input type="text" name="symbol" placeholder="Enter ticker (e.g. AAPL)" required>
-    <button type="submit">Go</button>
-  </form>
-  {% if chart %}
-    <img src="data:image/png;base64,{{ chart }}" alt="Chart">
-    <div class="comment">{{ comment }}</div>
-  {% endif %}
-</body>
-</html>
-"""
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# ------------------------------
+# 1. Fetch 30-day stock data
+# ------------------------------
+def get_stock_data(ticker):
+    try:
+        data = yf.download(ticker, period="30d", interval="1d")
+        if data.empty:
+            return None
+        return data
+    except Exception as e:
+        print(f"Error fetching stock data: {e}")
+        return None
+
+# ------------------------------
+# 2. Fetch recent headlines (NewsAPI.org)
+# ------------------------------
+def get_recent_news(ticker):
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        return "⚠️ No API key found (missing NEWSAPI_KEY)."
+
+    from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    query = quote(ticker)
+
+    url = (
+        f"https://newsapi.org/v2/everything?"
+        f"q={query}&"
+        f"from={from_date}&"
+        f"language=en&"
+        f"sortBy=publishedAt&"
+        f"pageSize=5&"
+        f"apiKey={api_key}"
+    )
+
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return f"⚠️ NewsAPI returned {r.status_code}: {r.json().get('message', 'unknown error')}"
+        data = r.json()
+    except Exception as e:
+        return f"⚠️ Network error while fetching headlines: {e}"
+
+    if data.get("status") != "ok":
+        msg = data.get("message", "unknown issue")
+        if "rateLimited" in msg:
+            return "⚠️ API quota reached for today (NewsAPI free plan)."
+        elif "apiKeyInvalid" in msg or "apiKeyMissing" in msg:
+            return "⚠️ Invalid or missing NewsAPI key."
+        else:
+            return f"⚠️ NewsAPI issue: {msg}"
+
+    articles = data.get("articles", [])
+    if not articles:
+        return "⚠️ No recent headlines available for this ticker."
+
+    headlines = [a["title"] for a in articles if "title" in a]
+    return "\n".join(f"- {h}" for h in headlines)
+
+# ------------------------------
+# 3. Flask route
+# ------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    ticker = request.args.get("symbol", "").upper()
-    if not ticker:
-        return render_template_string(TEMPLATE, ticker="Enter a symbol", chart=None, comment=None)
+    ticker = request.args.get("ticker", "AAPL").upper()
+    data = get_stock_data(ticker)
 
-    # Download recent data
-    data = yf.download(ticker, period="5d", interval="1h")
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    if data.empty or "Close" not in data:
-        return render_template_string(TEMPLATE, ticker=f"{ticker} (no data)", chart=None, comment=None)
+    if data is None:
+        return Response(f"<h3>No stock data found for {ticker}</h3>", mimetype="text/html")
 
-    # Plot
-    plt.figure(figsize=(6,3))
-    plt.plot(data.index, data["Close"], color="blue")
-    plt.title(f"{ticker} - Last 5 Days")
-    plt.xlabel("Date")
-    plt.ylabel("Price ($)")
-    plt.gca().yaxis.set_major_formatter(mtick.StrMethodFormatter('${x:,.2f}'))
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
-    plt.gcf().autofmt_xdate(rotation=30)
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
-    chart_base64 = base64.b64encode(buf.read()).decode("utf-8")
-
-    # Compute price stats
+    # Calculate price move
     first_close = float(data["Close"].iloc[0])
     last_close = float(data["Close"].iloc[-1])
-    change = round(last_close - first_close, 2)
     pct_change = (last_close - first_close) / first_close * 100
 
-    # Get recent headlines from Yahoo Finance
-    news = yf.Ticker(ticker).news
-    recent_news = []
-    if news:
-        for item in news[:5]:
-            title = item.get("title", "")
-            if len(title) > 30 and not any(x in title.lower() for x in ["market cap", "dividend", "stock quote"]):
-                recent_news.append(f"- {title}")
-    headlines_text = "\n".join(recent_news) if recent_news else "No major headlines available."
+    # Plot chart (last 30 days)
+    plt.figure(figsize=(6, 4))
+    plt.plot(data.index, data["Close"], color="blue")
+    plt.title(f"{ticker} - Last 30 Days")
+    plt.xlabel("Date")
+    plt.ylabel("Price ($)")
+    plt.xticks(
+        data.index[::7],  # every 7th day
+        [d.strftime("%m-%d") for d in data.index[::7]],
+        rotation=30,
+        ha="right"
+    )
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
 
-    # Build smarter analyst-style prompt
+    # Save plot as base64
+    img = io.BytesIO()
+    plt.savefig(img, format="png")
+    img.seek(0)
+    plot_url = base64.b64encode(img.getvalue()).decode()
+    plt.close()
+
+    # Fetch news
+    headlines = get_recent_news(ticker)
+
+    # Create GPT prompt
     prompt = f"""
-You are a sell-side equity analyst writing a concise market recap for investors.
+You are a professional equity research analyst writing a short market note.
 
 Ticker: {ticker}
-5-day move: ${first_close:.2f} → ${last_close:.2f} ({pct_change:+.2f}% change)
+Recent 30-day move: ${first_close:.2f} → ${last_close:.2f} ({pct_change:.2f}%)
 
-Recent headlines:
-{headlines_text}
+Recent news headlines:
+{headlines}
 
-Instructions:
-- Identify the key catalysts or news items from the headlines that likely explain {ticker}'s recent price action.
-- Mention macro or peer factors only if they are relevant (e.g., interest rates, sector momentum, AI trends, etc.).
-- Conclude with a succinct professional takeaway, in 2–3 complete sentences.
-- Ensure the final output ends naturally with a full sentence—no abrupt cutoffs.
-- Use a polished analyst tone suitable for an institutional client morning note.
+Write a concise, professional commentary explaining what likely drove this price performance.
+Follow these rules:
+- Base reasoning on the specific headlines above (e.g., product launches, earnings, analyst calls).
+- Avoid vague platitudes like "investor sentiment" unless clearly supported.
+- Always finish your response in complete sentences — never cut off mid-thought.
+- Maintain a polished institutional tone.
+- End with one analytical takeaway about near-term direction.
 """
 
+    # Generate AI summary
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=180,
+            max_tokens=250,
             temperature=0.7,
         )
         comment = response.choices[0].message.content.strip()
     except Exception as e:
         comment = f"(AI summary unavailable: {e})"
 
-    html = render_template_string(TEMPLATE, ticker=ticker, chart=chart_base64, comment=comment)
+    # HTML template
+    html = f"""
+    <html>
+    <head>
+        <title>{ticker} Stock Snapshot</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                text-align: center;
+                margin: 40px;
+                background-color: #fafafa;
+            }}
+            img {{
+                border-radius: 12px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                margin-top: 20px;
+            }}
+            p {{
+                width: 80%;
+                margin: 20px auto;
+                line-height: 1.6;
+                font-size: 16px;
+                text-align: justify;
+            }}
+            .warning {{
+                color: gray;
+                font-style: italic;
+                font-size: 14px;
+            }}
+            input, button {{
+                font-size: 16px;
+                padding: 6px;
+                margin: 4px;
+                border-radius: 6px;
+                border: 1px solid #ccc;
+            }}
+            button {{
+                background-color: #007bff;
+                color: white;
+                cursor: pointer;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>{ticker} Stock Snapshot</h2>
+        <form method="get">
+            <input type="text" name="ticker" placeholder="Enter ticker (e.g. AAPL)" value="{ticker}" />
+            <button type="submit">Go</button>
+        </form>
+        <img src="data:image/png;base64,{plot_url}" alt="Stock Chart" width="500"/>
+        <p><b>Market Recap:</b> {comment}</p>
+        {"<p class='warning'>" + headlines + "</p>" if headlines.startswith("⚠️") else ""}
+    </body>
+    </html>
+    """
+
     return Response(html, mimetype="text/html")
 
-
+# ------------------------------
+# 4. Run app
+# ------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
