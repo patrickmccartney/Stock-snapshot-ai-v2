@@ -2,6 +2,7 @@ import io, base64
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
+import matplotlib.dates as mdates
 import yfinance as yf
 from flask import Flask, render_template_string, request, Response
 from openai import OpenAI
@@ -20,7 +21,7 @@ TEMPLATE = """
     img { max-width:100%%; border-radius:12px; box-shadow:0 0 10px #ccc; }
     input { padding:0.5em; font-size:1em; border-radius:6px; border:1px solid #aaa; }
     button { padding:0.5em 1em; font-size:1em; border:none; border-radius:6px; background:#007bff; color:white; cursor:pointer; }
-    .comment { margin-top:1em; font-size:1.1em; }
+    .comment { margin-top:1em; font-size:1.1em; max-width:700px; margin-left:auto; margin-right:auto; text-align:left; }
   </style>
 </head>
 <body>
@@ -43,20 +44,22 @@ def index():
     if not ticker:
         return render_template_string(TEMPLATE, ticker="Enter a symbol", chart=None, comment=None)
 
-    # Download last 5 days of intraday prices
+    # Download recent data
     data = yf.download(ticker, period="5d", interval="1h")
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
     if data.empty or "Close" not in data:
         return render_template_string(TEMPLATE, ticker=f"{ticker} (no data)", chart=None, comment=None)
 
-    # Plot the chart
+    # Plot
     plt.figure(figsize=(6,3))
     plt.plot(data.index, data["Close"], color="blue")
     plt.title(f"{ticker} - Last 5 Days")
     plt.xlabel("Date")
     plt.ylabel("Price ($)")
     plt.gca().yaxis.set_major_formatter(mtick.StrMethodFormatter('${x:,.2f}'))
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    plt.gcf().autofmt_xdate(rotation=30)
     plt.tight_layout()
 
     buf = io.BytesIO()
@@ -65,33 +68,45 @@ def index():
     buf.seek(0)
     chart_base64 = base64.b64encode(buf.read()).decode("utf-8")
 
-    # Compute movement stats
+    # Compute price stats
     first_close = float(data["Close"].iloc[0])
     last_close = float(data["Close"].iloc[-1])
     change = round(last_close - first_close, 2)
     pct_change = (last_close - first_close) / first_close * 100
 
-    # Smarter financial-style prompt
+    # Get recent headlines from Yahoo Finance
+    news = yf.Ticker(ticker).news
+    recent_news = []
+    if news:
+        for item in news[:5]:
+            title = item.get("title", "")
+            if len(title) > 30 and not any(x in title.lower() for x in ["market cap", "dividend", "stock quote"]):
+                recent_news.append(f"- {title}")
+    headlines_text = "\n".join(recent_news) if recent_news else "No major headlines available."
+
+    # Build smarter analyst-style prompt
     prompt = f"""
-You are a financial analyst writing a concise 2–3 sentence daily note.
+You are a sell-side equity analyst writing a concise market recap for investors.
 
 Ticker: {ticker}
-Price moved from ${first_close:.2f} to ${last_close:.2f} over the past 5 days ({pct_change:+.2f}% change).
+5-day move: ${first_close:.2f} → ${last_close:.2f} ({pct_change:+.2f}% change)
 
-Task:
-- Identify notable news or events from the past 5 days that likely influenced {ticker}'s share price.
-- If earnings occurred, summarize investor reaction.
-- Include possible macro or peer factors.
-- End with a short analytical takeaway.
+Recent headlines:
+{headlines_text}
 
-Use a factual, market-commentary tone.
+Instructions:
+- Identify the key catalysts or news items from the headlines that likely explain {ticker}'s recent price action.
+- Mention macro or peer factors only if they are relevant (e.g., interest rates, sector momentum, AI trends, etc.).
+- Conclude with a succinct professional takeaway, in 2–3 complete sentences.
+- Ensure the final output ends naturally with a full sentence—no abrupt cutoffs.
+- Use a polished analyst tone suitable for an institutional client morning note.
 """
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
+            max_tokens=180,
             temperature=0.7,
         )
         comment = response.choices[0].message.content.strip()
@@ -100,6 +115,7 @@ Use a factual, market-commentary tone.
 
     html = render_template_string(TEMPLATE, ticker=ticker, chart=chart_base64, comment=comment)
     return Response(html, mimetype="text/html")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
